@@ -1,86 +1,115 @@
 // examples/blinky.rs
 
+#![deny(warnings)]
+#![feature(const_fn)]
 #![feature(used)]
+#![feature(proc_macro)]
 #![no_std]
 
-// version = "0.2.0", default-features = false
-extern crate cast;
+extern crate cortex_m_rtfm as rtfm;
 extern crate cortex_m;
 extern crate cortex_m_rt;
-extern crate cortex_m_semihosting;
 extern crate stm32f303x_e;
 
-use core::u16;
+use cortex_m::peripheral::syst::SystClkSource;
+use rtfm::{app, Threshold};
+use stm32f303x_e::{GPIOA, GPIOC, EXTI};
 
-use cast::{u16, u32};
-use cortex_m::asm;
-use stm32f303x_e::Peripherals;
+const MAX_LEVEL: usize = 8; // Must be a power of 2
 
-mod frequency {
-    /// Frequency of APB1 bus (TIM7 is connected to this bus)
-    pub const APB1: u32 = 8_000_000;
+app! {
+    device: stm32f303x_e,
+    resources: {
+        static LEVEL: usize = 0;
+        static MODE: usize = 1;
+        static IGNORE_BUTTON: usize = 0;
+    },
+    tasks: {
+        EXTI15_10: {
+            path: next_mode,
+            resources: [MODE, IGNORE_BUTTON],
+        },
+        SYS_TICK: {
+            path: periodic,
+            resources: [LEVEL, MODE, IGNORE_BUTTON],
+        },
+    },
 }
 
-/// Timer frequency
-const FREQUENCY: u32 = 1;
+// INITIALIZATION PHASE
+fn init(mut p: init::Peripherals, _r: init::Resources) {
+    // Configure the PA5 pin as output pin, and PC13 as input
+    p.device.RCC.ahbenr.modify(|_, w| w.iopaen().set_bit());
+    p.device.RCC.ahbenr.modify(|_, w| w.iopcen().set_bit());
+    p.device.GPIOA.moder.modify(
+        |_, w| unsafe { w.moder5().bits(0b01) },
+    );
+    p.device.GPIOC.moder.modify(
+        |_, w| unsafe { w.moder13().bits(0b00) },
+    );
 
-#[inline(never)]
-fn main() {
-    // Critical section, this closure is non-preemptable
-    cortex_m::interrupt::free(|_cs| {
-        // INITIALIZATION PHASE
-        // Exclusive access to the peripherals
-        let peripherals = Peripherals::take().unwrap();
-        let gpioa = peripherals.GPIOA;
-        let rcc = peripherals.RCC;
-        let tim7 = peripherals.TIM7;
+    // configure the system timer to generate one interrupt every one-eighth second
+    p.core.SYST.set_clock_source(SystClkSource::Core);
+    p.core.SYST.set_reload(1_000_000); // 0.125s
+    p.core.SYST.enable_interrupt();
+    p.core.SYST.enable_counter();
 
-        // Power up the relevant peripherals
-        rcc.ahbenr.modify(|_, w| w.iopaen().set_bit());
-        rcc.apb1enr.modify(|_, w| w.tim7en().set_bit());
+    p.core.NVIC.enable(
+        stm32f303x_e::interrupt::Interrupt::EXTI15_10,
+    );
 
-        // Configure the pin PA5 as an output pin
-        gpioa.moder.modify(|_, w| unsafe { w.moder5().bits(0b01) });
-
-        // Configure TIM7 for periodic timeouts
-        let ratio = frequency::APB1 / FREQUENCY;
-        let psc = u16((ratio - 1) / u32(u16::MAX)).unwrap();
-        tim7.psc.write(|w| unsafe { w.psc().bits(psc) });
-        let arr = u16(ratio / u32(psc + 1)).unwrap();
-        tim7.arr.write(|w| unsafe { w.arr().bits(arr) });
-        tim7.cr1.write(|w| w.opm().clear_bit());
-
-        // Start the timer
-        tim7.cr1.modify(|_, w| w.cen().set_bit());
-
-        // APPLICATION LOGIC
-        let mut state = false;
-        loop {
-            // Wait for an update event
-            while !tim7.sr.read().uif().bit() {}
-
-            // Clear the update event flag
-            tim7.sr.modify(|_, w| w.uif().clear_bit());
-
-            // Toggle the state
-            state = !state;
-
-            // Blink the LED
-            if state {
-                gpioa.bsrr.write(|w| w.bs5().set_bit());
-            } else {
-                gpioa.bsrr.write(|w| w.br5().set_bit());
-            }
-        }
+    // Connect GPIOC13 to EXTI13 interrupt
+    p.device.SYSCFG.exticr4.modify(|_, w| unsafe {
+        w.exti13().bits(0b010)
     });
+
+    // Enable the external interrupt for the push button on rise
+    p.device.EXTI.imr1.modify(|_, w| w.mr13().set_bit());
+    p.device.EXTI.emr1.modify(|_, w| w.mr13().set_bit());
+    p.device.EXTI.rtsr1.modify(|_, w| w.tr13().set_bit());
 }
 
-// This part is the same as before
-#[allow(dead_code)]
-#[used]
-#[link_section = ".vector_table.interrupts"]
-static INTERRUPTS: [extern "C" fn(); 240] = [default_handler; 240];
+// IDLE LOOP
+fn idle() -> ! {
+    // Sleep
+    loop {
+        rtfm::wfi();
+    }
+}
 
-extern "C" fn default_handler() {
-    asm::bkpt();
+fn periodic(_t: &mut Threshold, mut r: SYS_TICK::Resources) {
+    *r.LEVEL = (*r.LEVEL + 1) & (MAX_LEVEL - 1);
+
+    if (*r.LEVEL & *r.MODE) > 0 {
+        unsafe {
+            (*GPIOA::ptr()).bsrr.write(|w| w.bs5().set_bit());
+        }
+    } else {
+        unsafe {
+            (*GPIOA::ptr()).bsrr.write(|w| w.br5().set_bit());
+        }
+    }
+
+    if *r.IGNORE_BUTTON > 0 {
+        *r.IGNORE_BUTTON -= 1;
+    }
+}
+
+fn next_mode(_t: &mut Threshold, mut r: EXTI15_10::Resources) {
+    if *r.IGNORE_BUTTON > 0 {
+        return;
+    }
+
+    unsafe {
+        if (*GPIOC::ptr()).idr.read().idr13().bit_is_set() {
+            return;
+        }
+        (*EXTI::ptr()).pr1.reset();
+    }
+
+    *r.IGNORE_BUTTON = 4;
+    *r.MODE *= 2;
+    if *r.MODE >= MAX_LEVEL {
+        *r.MODE = 1;
+    }
 }

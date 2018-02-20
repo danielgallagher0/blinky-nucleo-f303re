@@ -28,18 +28,18 @@ lto = true
 debug = true
 
 [dependencies]
-stm32f303x_e = { path = "../stm32f303x_e/" }
-cast = { version = "0.2.2", default-features = false }
+stm32f303x_e = { path = "../stm32f303x_e/", features = ["rt"] }
+
+[dependencies.cortex-m-rtfm]
+version = "*"
+features = ["cm7-r0p1"]
 
 [dependencies.cortex-m]
-version = "0.3.0"
+version = "0.4.0"
 
 [dependencies.cortex-m-rt]
-version = "0.3.12"
+version = "0.3.9"
 features = ["abort-on-panic"]
-
-[dependencies.cortex-m-semihosting]
-version = "0.2.0"
 
 [target]
 
