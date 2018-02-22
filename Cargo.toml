@@ -27,18 +27,19 @@ incremental = false
 lto = true
 debug = true
 
-[dependencies]
-stm32f303x_e = { path = "../stm32f303x_e/", features = ["rt"] }
+[dependencies.stm32f30x]
+version ="0.6.0"
+features = ["rt"]
 
 [dependencies.cortex-m-rtfm]
-version = "*"
+version = "0.3.0"
 features = ["cm7-r0p1"]
 
 [dependencies.cortex-m]
 version = "0.4.0"
 
 [dependencies.cortex-m-rt]
-version = "0.3.9"
+version = "0.3.0"
 features = ["abort-on-panic"]
 
 [target]

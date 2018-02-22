@@ -9,19 +9,20 @@
 extern crate cortex_m_rtfm as rtfm;
 extern crate cortex_m;
 extern crate cortex_m_rt;
-extern crate stm32f303x_e;
+extern crate stm32f30x;
 
 use cortex_m::peripheral::syst::SystClkSource;
 use rtfm::{app, Threshold};
-use stm32f303x_e::{GPIOA, GPIOC, EXTI};
+use stm32f30x::{GPIOA, GPIOC, EXTI};
 
 const MAX_LEVEL: usize = 8; // Must be a power of 2
+const MAX_MODE: usize = MAX_LEVEL / 2;
 
 app! {
-    device: stm32f303x_e,
+    device: stm32f30x,
     resources: {
         static LEVEL: usize = 0;
-        static MODE: usize = 1;
+        static MODE: usize = MAX_MODE;
         static IGNORE_BUTTON: usize = 0;
     },
     tasks: {
@@ -30,7 +31,7 @@ app! {
             resources: [MODE, IGNORE_BUTTON],
         },
         SYS_TICK: {
-            path: periodic,
+            path: maybe_toggle,
             resources: [LEVEL, MODE, IGNORE_BUTTON],
         },
     },
@@ -38,27 +39,34 @@ app! {
 
 // INITIALIZATION PHASE
 fn init(mut p: init::Peripherals, _r: init::Resources) {
-    // Configure the PA5 pin as output pin, and PC13 as input
+    // Configure the PA5 pin as output (user LED)
     p.device.RCC.ahbenr.modify(|_, w| w.iopaen().set_bit());
-    p.device.RCC.ahbenr.modify(|_, w| w.iopcen().set_bit());
     p.device.GPIOA.moder.modify(
-        |_, w| unsafe { w.moder5().bits(0b01) },
-    );
-    p.device.GPIOC.moder.modify(
-        |_, w| unsafe { w.moder13().bits(0b00) },
+        |_, w| w.moder5().output()
     );
 
-    // configure the system timer to generate one interrupt every one-eighth second
+    // Configure the PC13 in as input (user button)
+    p.device.RCC.ahbenr.modify(|_, w| w.iopcen().set_bit());
+    p.device.GPIOC.moder.modify(
+        |_, w| w.moder13().input()
+    );
+    p.device.GPIOC.pupdr.modify(|_, w| unsafe {
+        w.pupdr13().bits(0b01)  // Pull-up
+    });
+
+    // Configure the system timer to generate one interrupt every one-eighth
+    // second, so we can fully blink the LED up to 4 times per second.
     p.core.SYST.set_clock_source(SystClkSource::Core);
     p.core.SYST.set_reload(1_000_000); // 0.125s
     p.core.SYST.enable_interrupt();
     p.core.SYST.enable_counter();
 
+    // Enable the EXTI13 interrupt
     p.core.NVIC.enable(
-        stm32f303x_e::interrupt::Interrupt::EXTI15_10,
+        stm32f30x::interrupt::Interrupt::EXTI15_10,
     );
 
-    // Connect GPIOC13 to EXTI13 interrupt
+    // Connect GPIOC13 (user button) to EXTI13 interrupt
     p.device.SYSCFG.exticr4.modify(|_, w| unsafe {
         w.exti13().bits(0b010)
     });
@@ -77,9 +85,10 @@ fn idle() -> ! {
     }
 }
 
-fn periodic(_t: &mut Threshold, mut r: SYS_TICK::Resources) {
+fn maybe_toggle(_t: &mut Threshold, mut r: SYS_TICK::Resources) {
     *r.LEVEL = (*r.LEVEL + 1) & (MAX_LEVEL - 1);
 
+    // Turn the LED on iff the mode bit is on
     if (*r.LEVEL & *r.MODE) > 0 {
         unsafe {
             (*GPIOA::ptr()).bsrr.write(|w| w.bs5().set_bit());
@@ -96,20 +105,32 @@ fn periodic(_t: &mut Threshold, mut r: SYS_TICK::Resources) {
 }
 
 fn next_mode(_t: &mut Threshold, mut r: EXTI15_10::Resources) {
+    // We've handled the interrupt
+    unsafe {
+        (*EXTI::ptr()).pr1.reset();
+    }
+
+    // Ignore a bouncing signal
     if *r.IGNORE_BUTTON > 0 {
         return;
     }
 
     unsafe {
+        // PC13 is pulled high by default, so if it's set, the button is not
+        // pressed.
         if (*GPIOC::ptr()).idr.read().idr13().bit_is_set() {
             return;
         }
-        (*EXTI::ptr()).pr1.reset();
     }
 
+    // We ignore a bouncing signal, so ignore any other activations for a few
+    // cycles.  This value is decreased when the timer fires.
     *r.IGNORE_BUTTON = 4;
-    *r.MODE *= 2;
-    if *r.MODE >= MAX_LEVEL {
-        *r.MODE = 1;
+
+    // Increase the rate of the blinking LED, or cycle back from fastest to
+    // slowest.
+    *r.MODE /= 2;
+    if *r.MODE == 0 {
+        *r.MODE = MAX_MODE;
     }
 }
